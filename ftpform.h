@@ -7,6 +7,13 @@
 #include <QFileInfo>
 #include"qftp/qurlinfo.h"
 #include <QProgressBar>
+#include<QPushButton>
+struct DownloadTask
+{
+    QString remotePath;   // 完整远程路径
+    QString localPath;    // 完整本地路径
+};
+
 namespace Ui {
 class ftpform;
 }
@@ -16,37 +23,51 @@ class ftpform : public QWidget
     Q_OBJECT
 
 public:
-    void initftp();
-    void initTable();
     explicit ftpform(QWidget *parent = nullptr);
     ~ftpform();
 
-    void downloadFile(QString remoteFile);
-    void scanDirRecursive(QString path);
-    void startDownloadDir(QString dirPath);
-
 private slots:
     void on_FTPconnect_clicked();
-    void onCommandFinished(int, bool);
-    void onListInfo(QUrlInfo);
-    void onProgress(qint64 read, qint64 total);
+    void onCommandFinished(int id, bool error);
+    void onListInfo(QUrlInfo info);
+    void onProgress(qint64, qint64);
 
 private:
     Ui::ftpform *ui;
     QFtp *ftp;
-    QString localRootDir;   // 本地保存根目录
-    QString remoteRootDir; // 远程FTP目录
-    QMap<QString, QUrlInfo> fileInfoMap; // 文件信息
-    qint64 totalBytes;     // 总大小
-    qint64 finishedBytes;  // 已下载大小
-    bool isDownloading;    // 是否正在下载
 
-    QStringList downloadQueue;
-    int currentFileIndex;
+    void initFtp();
+    void initTable();
 
-    QString currentDownloadRemoteDir;  // 当前正在下载的远程目录
-    QString currentDownloadLocalDir;   // 对应本地目录
-    void downloadFolder(const QString &remoteFolder, const QString &localFolder);
+    // 递归下载
+    void startRecursiveScan(const QString &remoteDir, const QString &localDir);
+    void processNextTask();
+
+    // 下载状态
+    bool m_isDownloadingFolder = false;
+    QString m_currentRemoteDir;
+    QString m_currentLocalDir;
+    QList<DownloadTask> m_taskList;
+
+    // 界面文件项
+    struct FileItem
+    {
+        QString name;
+        bool isDir;
+        QPushButton *btn;
+        QProgressBar *bar;
+        QFile *file;
+    };
+    QList<FileItem> m_fileList;
+
+
+
+
+    void loadFtpConfig();
+    QString m_ftpIP;
+    int m_ftpPort;
+    QString m_ftpUser;
+    QString m_ftpPwd;
+
 };
-
 #endif // FTPFORM_H

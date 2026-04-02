@@ -1,50 +1,20 @@
 #include "ftpform.h"
 #include "ui_ftpform.h"
 #include <QMessageBox>
-#include <QDebug>
-#include <QFile>
-#include <QPushButton>
-#include <QProgressBar>
 #include <QDir>
+#include <QProgressBar>
+#include <QPushButton>
+#include<QDebug>
+#include<QTimer>
+#include <QSettings>
 
-struct FileItem {
-    QString name;
-    QPushButton *btn;
-    QProgressBar *bar;
-    QFile *file;
-    bool isDir;
-    char padding[3] = {0};
-};
-
-static QList<FileItem> g_fileList;
-static QString g_currentRemotePath = "/";
-
-void ftpform::initftp()
-{
-    ftp = new QFtp(this);
-    connect(ftp, SIGNAL(commandFinished(int,bool)),this, SLOT(onCommandFinished(int,bool)));
-    connect(ftp, SIGNAL(listInfo(QUrlInfo)),this, SLOT(onListInfo(QUrlInfo)));
-    connect(ftp, SIGNAL(dataTransferProgress(qint64,qint64)),this,SLOT(onProgress(qint64,qint64)));
-
-}
-
-void ftpform::initTable()
-{
-    ui->tableWidget->setColumnCount(6);
-    QStringList headers;
-    headers << "序号" << "名称" << "日期" << "大小" << "操作" << "进度";
-    ui->tableWidget->setHorizontalHeaderLabels(headers);
-    ui->tableWidget->verticalHeader()->setVisible(false);
-    ui->tableWidget->setColumnWidth(4, 110);
-    ui->tableWidget->setColumnWidth(5, 160);
-}
-
-ftpform::ftpform(QWidget *parent) :
-    QWidget(parent),
-    ui(new Ui::ftpform)
+ftpform::ftpform(QWidget *parent)
+    : QWidget(parent)
+    , ui(new Ui::ftpform)
 {
     ui->setupUi(this);
-    initftp();
+    loadFtpConfig();
+    initFtp();
     initTable();
 }
 
@@ -53,31 +23,61 @@ ftpform::~ftpform()
     delete ui;
 }
 
+void ftpform::initFtp()
+{
+    ftp = new QFtp(this);
+    connect(ftp, &QFtp::commandFinished, this, &ftpform::onCommandFinished);
+    connect(ftp, &QFtp::listInfo, this, &ftpform::onListInfo);
+    connect(ftp, &QFtp::dataTransferProgress, this, &ftpform::onProgress);
+}
+
+void ftpform::initTable()
+{
+    ui->tableWidget->setColumnCount(6);
+    ui->tableWidget->setHorizontalHeaderLabels({"序号", "名称", "日期", "大小", "操作", "进度"});
+    ui->tableWidget->verticalHeader()->setVisible(false);
+    ui->tableWidget->setColumnWidth(4, 110);
+    ui->tableWidget->setColumnWidth(5, 160);
+    ui->tableWidget->setAlternatingRowColors(false); // 可选，让界面更干净
+    ui->tableWidget->setStyleSheet("QTableWidget::item { alignment: center; }");
+}
+
 void ftpform::on_FTPconnect_clicked()
 {
-    QString ip = ui->widget->getIP();
-    if (ip.isEmpty() || ip == "...") {
-        QMessageBox::warning(this, "提示", "IP不能为空！");
+
+    if (m_ftpIP.isEmpty()) {
+        QMessageBox::warning(this, "提示", "配置文件中IP不能为空！");
         return;
     }
 
-    ftp->connectToHost(ip, 21);
-    ftp->login("test", "123456");
+    ftp->connectToHost(m_ftpIP, m_ftpPort);
+    ftp->login(m_ftpUser, m_ftpPwd);
 }
 
 void ftpform::onCommandFinished(int, bool error)
 {
-    if (error) return;
+    if (error) {
+        qDebug() << "FTP 错误：" << ftp->errorString();
+        return;
+    }
 
     if (ftp->currentCommand() == QFtp::Login) {
         QMessageBox::information(this, "成功", "登录成功！");
         ui->tableWidget->setRowCount(0);
-        g_fileList.clear();
-        ftp->list(g_currentRemotePath);
+        m_fileList.clear();
+        ftp->list("/");
+        return;
     }
-    else if (ftp->currentCommand() == QFtp::Get) {
-        // 下载完成逻辑移到这里
-        for (auto &item : g_fileList) {
+
+    if (ftp->currentCommand() == QFtp::List) {
+        if (m_isDownloadingFolder) {
+            processNextTask();
+        }
+        return;
+    }
+
+    if (ftp->currentCommand() == QFtp::Get) {
+        for (auto &item : m_fileList) {
             if (item.btn && item.btn->text() == "下载中...") {
                 if (item.file) {
                     item.file->close();
@@ -85,77 +85,201 @@ void ftpform::onCommandFinished(int, bool error)
                     item.file = nullptr;
                 }
                 item.btn->setText("已完成");
-                item.btn->setStyleSheet(R"(
-                    border:none; padding:5px 12px; background:#2E8B57; color:white; border-radius:3px;
-                )");
+                item.btn->setStyleSheet("border:none; padding:5px 12px; background:#2E8B57; color:white; border-radius:3px;");
                 break;
             }
         }
+        processNextTask();
     }
 }
 
 void ftpform::onProgress(qint64 read, qint64 total)
 {
-    for (auto &item : g_fileList) {
+    for (auto &item : m_fileList) {
         if (item.btn && item.btn->text() == "下载中...") {
             item.bar->setMaximum(static_cast<int>(total));
-                        item.bar->setValue(static_cast<int>(read));
+            item.bar->setValue(static_cast<int>(read));
             break;
         }
     }
 }
 
-
-
-// ==============================================
-// 核心：显示文件夹 + 文件
-// ==============================================
-void ftpform::onListInfo(QUrlInfo info)
+// ==============================
+// 递归扫描文件夹（安全模式）
+// ==============================
+void ftpform::startRecursiveScan(const QString &remoteDir, const QString &localDir)
 {
-    if (info.name() == "." || info.name() == "..") return;
+    // ========================
+       // 自动重连（修复掉线）
+       // ========================
+       if (ftp->state() == QFtp::Unconnected) {
+           qDebug() << "FTP 已断开，自动重连中...";
+           // 重新连接（IP 填你的 FTP 服务器 IP）
+           ftp->connectToHost(m_ftpIP, m_ftpPort);
+           ftp->login(m_ftpUser, m_ftpPwd);
 
-    int row = ui->tableWidget->rowCount();
-    ui->tableWidget->insertRow(row);
 
-    ui->tableWidget->setItem(row, 0, new QTableWidgetItem(QString::number(row + 1)));
+           // 重连后再下载
+           QTimer::singleShot(1000, this, [=]() {
+               startRecursiveScan(remoteDir, localDir);
+           });
+           return;
+       }
 
-    QString showName = info.name();
-    bool isDir = info.isDir();
+       qDebug() << "\n=====================================";
+       qDebug() << "📂 开始下载文件夹：";
+       qDebug() << "远程路径：" << remoteDir;
+       qDebug() << "本地路径：" << localDir;
+       qDebug() << "=====================================\n";
 
-    if (isDir) {
-        showName = "📁 " + showName;
+       m_isDownloadingFolder = true;
+       m_currentRemoteDir = remoteDir;
+       m_currentLocalDir = localDir;
+       QDir().mkpath(localDir);
+       ftp->cd(remoteDir);
+       ftp->list();
+}
+
+// ==============================
+// 执行下一个下载任务
+// ==============================
+void ftpform::processNextTask()
+{
+    if (m_taskList.isEmpty()) {
+        m_isDownloadingFolder = false;
+        m_currentRemoteDir.clear();
+        m_currentLocalDir.clear();
+        qDebug() << " 全部下载完成！";
+        return;
     }
 
-    ui->tableWidget->setItem(row, 1, new QTableWidgetItem(showName));
+    DownloadTask task = m_taskList.first();
+    m_taskList.pop_front();
+
+    // 如果是文件夹
+    if (task.remotePath.endsWith("/")) {
+        qDebug() << "处理文件夹：" << task.remotePath;
+
+        QDir().mkpath(task.localPath);
+        m_currentRemoteDir = task.remotePath;
+        m_currentLocalDir = task.localPath;
+
+        ftp->cd(task.remotePath);
+        ftp->list();
+    }
+    // 如果是文件
+    else {
+        qDebug() << "开始下载：" << task.localPath;
+
+        QFile *file = new QFile(task.localPath);
+        if (!file->open(QIODevice::WriteOnly)) {
+            file->deleteLater();
+            processNextTask();
+            return;
+        }
+        ftp->get(task.remotePath, file);
+
+    }
+}
+
+void ftpform::loadFtpConfig()
+{
+    QSettings config("ftpconfig.ini", QSettings::IniFormat);
+    config.setIniCodec("UTF-8");
+
+    // 读取配置（没有则自动创建默认值）
+    m_ftpIP   = config.value("FTP/IP",   "127.0.0.1").toString();
+    m_ftpPort = config.value("FTP/Port", 21).toInt();
+    m_ftpUser = config.value("FTP/User", "test").toString();
+    m_ftpPwd  = config.value("FTP/Pwd",  "123456").toString();
+
+    qDebug() << "加载FTP配置：" << m_ftpIP << m_ftpPort << m_ftpUser;
+}
+
+// ==============================
+// 列表信息（完全隔离界面/下载）
+// ==============================
+void ftpform::onListInfo(QUrlInfo info)
+{
+    if (info.name() == "." || info.name() == "..")
+        return;
+
+    if (m_isDownloadingFolder) {
+        if (info.isDir()) {
+            DownloadTask task;
+            task.remotePath = m_currentRemoteDir + info.name() + "/";
+            task.localPath = m_currentLocalDir + info.name() + "/";
+            m_taskList.append(task);
+        } else {
+            DownloadTask task;
+            task.remotePath = m_currentRemoteDir + info.name();
+            task.localPath = m_currentLocalDir + info.name();
+            m_taskList.append(task);
+
+            qDebug() << "加入文件：" << task.localPath;
+        }
+        return;
+    }
+    // ================== 正常界面显示 ==================
+    int row = ui->tableWidget->rowCount();
+    ui->tableWidget->insertRow(row);
+    ui->tableWidget->setItem(row, 0, new QTableWidgetItem(QString::number(row + 1)));
+    ui->tableWidget->item(row, 0)->setTextAlignment(Qt::AlignCenter);
+
+    bool isDir = info.isDir();
+    ui->tableWidget->setItem(row, 1, new QTableWidgetItem(isDir ? "📁 " + info.name() : info.name()));
+    ui->tableWidget->item(row, 1)->setTextAlignment(Qt::AlignCenter);
+
     ui->tableWidget->setItem(row, 2, new QTableWidgetItem(info.lastModified().toString("yyyy-MM-dd HH:mm")));
+    ui->tableWidget->item(row, 2)->setTextAlignment(Qt::AlignCenter);
 
     if (isDir) {
         ui->tableWidget->setItem(row, 3, new QTableWidgetItem("文件夹"));
+        ui->tableWidget->item(row, 3)->setTextAlignment(Qt::AlignCenter);
+
     } else {
-        qint64 size = info.size();
-        QString sizeStr;
-        if (size >= 1024*1024*1024) sizeStr = QString::number(size/(1024*1024*1024.0),'f',2)+" GB";
-        else if (size >= 1024*1024) sizeStr = QString::number(size/(1024*1024.0),'f',2)+" MB";
-        else if (size >= 1024)sizeStr = QString::number(size/1024.0, 'f', 2) + " KB";
-        else sizeStr = QString::number(size)+" B";
-        ui->tableWidget->setItem(row, 3, new QTableWidgetItem(sizeStr));
+        qint64 s = info.size();
+        QString sz;
+        if (s >= 1024*1024*1024) sz = QString::number(s/(1024*1024*1024.0),'f',2)+" GB";
+        else if (s >= 1024*1024) sz = QString::number(s/(1024*1024.0),'f',2)+" MB";
+        else if (s >= 1024) sz = QString::number(s/1024.0,'f',2)+" KB";
+        else sz = QString::number(s)+" B";
+        ui->tableWidget->setItem(row, 3, new QTableWidgetItem(sz));
+        ui->tableWidget->item(row, 3)->setTextAlignment(Qt::AlignCenter);
+
     }
 
-    QPushButton *btn = nullptr;
+    QWidget *btnWidget = new QWidget();
+    QHBoxLayout *layout = new QHBoxLayout(btnWidget);
+    layout->setContentsMargins(6, 3, 6, 3); // 边距
+
+    QPushButton *btn = new QPushButton();
+    btn->setSizePolicy(QSizePolicy::Fixed, QSizePolicy::Fixed);
+    layout->addWidget(btn);
+
     QProgressBar *bar = new QProgressBar();
     bar->setValue(0);
 
     if (!isDir) {
-        btn = new QPushButton("下载");
+        btn->setText("下载");
         btn->setStyleSheet(R"(
             QPushButton {
-                border:none; padding:5px 12px; background:#409EFF; color:white; border-radius:3px;
+                border:none;
+                padding:5px 12px;
+                background:#409EFF;
+                color:white;
+                border-radius:3px;
             }
-            QPushButton:hover { background:#3388EE; }
+            QPushButton:hover {
+                background:#3388EE;
+            }
         )");
+    } else {
+        btn->setText("下载文件夹");
+        btn->setStyleSheet("QPushButton{border:none;padding:5px 12px;background:#FF6666;color:white;border-radius:3px;}QPushButton:hover{background:#EE5555;}");
     }
 
-    ui->tableWidget->setCellWidget(row, 4, btn);
+    ui->tableWidget->setCellWidget(row, 4, btnWidget);
     ui->tableWidget->setCellWidget(row, 5, bar);
 
     FileItem item;
@@ -164,38 +288,30 @@ void ftpform::onListInfo(QUrlInfo info)
     item.btn = btn;
     item.bar = bar;
     item.file = nullptr;
-    g_fileList.append(item);
+    m_fileList.append(item);
 
-    if (btn) {
-        connect(btn, &QPushButton::clicked, this, [=]() {
-            if (btn->text() == "已完成" || btn->text() == "下载中...") return;
+    connect(btn, &QPushButton::clicked, this, [=]() {
+        if (btn->text() == "已完成" || btn->text() == "下载中...")
+            return;
 
-            btn->setText("下载中...");
-            btn->setStyleSheet(R"(
-                border:none; padding:5px 12px; background:#FF9500; color:white; border-radius:3px;
-            )");
+        btn->setText("下载中...");
+        btn->setStyleSheet("border:none;padding:5px 12px;background:#FF9500;color:white;border-radius:3px;");
 
-            QDir dir;
-            QString savePath = "D:/FTP_DOWNLOAD/";
-            dir.mkpath(savePath);
-            QString fullPath = savePath + info.name();
-
-            QFile *file = new QFile(fullPath);
-            if (!file->open(QIODevice::WriteOnly)) {
-                QMessageBox::warning(this, "错误", "保存失败");
-                file->deleteLater();
-                return;
-            }
-
-            for (auto &i : g_fileList) {
-                if (i.name == info.name() && !i.isDir) {
-                    i.file = file;
-                    break;
+        if (!isDir) {
+            QDir().mkpath("D:/FTP_DOWNLOAD/");
+            QString path = "D:/FTP_DOWNLOAD/" + info.name();
+            QFile *f = new QFile(path);
+            if (f->open(QIODevice::WriteOnly)) {
+                for (auto &i : m_fileList) {
+                    if (i.name == info.name() && !i.isDir)
+                        i.file = f;
                 }
+                ftp->get(info.name(), f);
             }
-
-            ftp->get(info.name(), file);
-        });
-    }
+        } else {
+            QString remote = "/" + info.name() + "/";
+            QString local = "D:/FTP_DOWNLOAD/" + info.name() + "/";
+            startRecursiveScan(remote, local);
+        }
+    });
 }
-

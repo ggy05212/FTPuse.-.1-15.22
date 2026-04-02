@@ -28,15 +28,13 @@ SOURCES += \
         mainwindow.cpp \
     qftp/qftp.cpp \
     qftp/qurlinfo.cpp \
-    ftpform.cpp \
-    ipinputwidget.cpp
+    ftpform.cpp
 
 HEADERS += \
         mainwindow.h \
     qftp/qftp.h \
     qftp/qurlinfo.h \
-    ftpform.h \
-    ipinputwidget.h
+    ftpform.h
 
 FORMS += \
         mainwindow.ui \
